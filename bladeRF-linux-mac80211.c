@@ -24,6 +24,7 @@
 #include <linux/genetlink.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
+#include <linux/nl80211.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -33,27 +34,47 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+
 #include "bladeRF-wiphy.h"
+
+#define TWENTY_MHZ (20 * 1000 * 1000)
+#define FORTY_MHZ  (40 * 1000 * 1000)
+#define EIGHTY_MHZ (80 * 1000 * 1000)
 
 pthread_mutex_t log_mutex;
 
-struct bladerf *bladeRF_dev;
-unsigned int local_freq = 0;
-unsigned int local_tx_freq = 0;
-unsigned int force_freq = 0;
-unsigned int updated_freq = 0;
-unsigned int half_rate_only = 0;
-int tx_gain = 0;
-int tx_mod = 0;
-int disable_agc = 0;
-int rx_gain = 0;
-int tun_tap = 0;
-int tun_tap_fd = 0;
+typedef struct {
+   // bladeRF device handle
+   struct bladerf *bladeRF_dev;
+
+   // bladeRF frequency variables
+   bladerf_frequency local_freq;
+   bladerf_frequency local_tx_freq;
+   unsigned int force_freq;
+   bladerf_frequency updated_freq;
+
+   unsigned int half_rate_only;
+
+   // TX/RX gain variables
+   int tx_gain;
+   int tx_mod;
+   int disable_agc;
+   int rx_gain;
+   int tun_tap;
+   int tun_tap_fd;
+
+   struct nl_sock *netlink_sock;
+   int netlink_family;
+} wiphy_device_t;
+
 
 bool debug_mode = 1;
 
-struct nl_sock *netlink_sock = NULL;
-int netlink_family = 0;
+wiphy_device_t wiphy_devices[1];
+
+
 
 struct tx_rate {
    uint8_t idx;
@@ -65,15 +86,16 @@ struct tx_rate_info {
    uint16_t info;
 };
 
-int set_new_frequency(unsigned long freq);
+int set_new_frequency(bladerf_frequency freq);
 int rx_frame(struct nl_sock *netlink_sock, int netlink_family, uint8_t *ptr, int len, int mod);
-int start_mac80211(char *cmd);
-int start_tun_tap(char *cmd);
+int start_mac80211(char *cmd, wiphy_device_t *wiphy_device);
+int start_tun_tap(char *cmd, wiphy_device_t *wiphy_device);
 
 
 unsigned int bytes_to_dwords(int bytes) {
     return (bytes + 3) / 4;
 }
+
 int bladerf_tx_frame(uint8_t *data, int len, int modulation, uint64_t cookie) {
     uint8_t *frame;
     int status;
@@ -88,13 +110,9 @@ int bladerf_tx_frame(uint8_t *data, int len, int modulation, uint64_t cookie) {
     memset(frame, 0, frame_len);
     memcpy(frame + sizeof(struct bladeRF_wiphy_header_tx), data, len);
 
-    //char msg[] = "\x55\x66\x00\x00" "\x07\x00\x02\x00" "\x0a\x00\x9a\x00" "\x00\x00\x00\x00" ;
-    //memcpy(frame, msg, sizeof(msg)-1);
-    //printf("PING\n");
-
     bwh_t->len = len;
 
-    if (half_rate_only) {
+    if (wiphy_devices[0].half_rate_only) {
        if (modulation == 1 || modulation == 3) {
           modulation--;
        } else if (modulation > 4) {
@@ -110,12 +128,8 @@ int bladerf_tx_frame(uint8_t *data, int len, int modulation, uint64_t cookie) {
         printf("TX =...");
         fflush(stdout);
     }
-    //int f;
-    //for (f = 0; f < frame_len; f++) {
-    //   printf("\\x%.2x", frame[f]);
-    //}
 
-    status = bladerf_sync_tx(bladeRF_dev, frame, bytes_to_dwords(frame_len), &meta, 0);
+    status = bladerf_sync_tx(wiphy_devices[0].bladeRF_dev, frame, bytes_to_dwords(frame_len), &meta, 0);
     if (debug_mode > 2) {
         printf("%d\n", status);
     }
@@ -142,6 +156,8 @@ void dump_packet(uint8_t *payload_data, int payload_len)
 
 int netlink_frame_callback(struct nl_msg *netlink_message, void *arg)
 {
+   wiphy_device_t *wiphy_device = (wiphy_device_t *)arg;
+
    /* netlink variables */
    struct nlmsghdr   *netlink_header = NULL;
    struct genlmsghdr *genlink_header = NULL;
@@ -149,7 +165,7 @@ int netlink_frame_callback(struct nl_msg *netlink_message, void *arg)
    struct nlattr *genlink_attribute_head = NULL;
    int            genlink_attribute_len  = 0;
 
-   struct nlattr *attribute_table[25 /* MAX */ + 1 ];
+   struct nlattr *attribute_table[NL80211_ATTR_MAX + 1];
 
    /* frame variables */
    uint8_t *payload_data;
@@ -169,31 +185,34 @@ int netlink_frame_callback(struct nl_msg *netlink_message, void *arg)
    netlink_header = nlmsg_hdr(netlink_message);
    genlink_header = genlmsg_hdr(netlink_header);
 
-   if (genlink_header->cmd != 2 /* FRAME */ && genlink_header->cmd != 7 /* FREQ */ ) {
+   if (genlink_header->cmd != NL80211_CMD_FRAME && 
+       genlink_header->cmd != NL80211_CMD_SET_WIPHY) {
       return 0;
    }
 
    /* parse attributes into table */
    genlink_attribute_len = genlmsg_attrlen(genlink_header, 0);
    genlink_attribute_head = genlmsg_attrdata(genlink_header, 0);
-   nla_parse(attribute_table, 25 /* MAX */, genlink_attribute_head,
+   nla_parse(attribute_table, NL80211_ATTR_MAX, genlink_attribute_head,
                                             genlink_attribute_len, NULL);
 
-   frequency = nla_get_u32(attribute_table[19 /* FREQ */ ]);
+   if (attribute_table[NL80211_ATTR_WIPHY_FREQ]) {
+      frequency = nla_get_u32(attribute_table[NL80211_ATTR_WIPHY_FREQ]);
+   }
 
-   if (genlink_header->cmd == 2 /* FRAME */) {
-      payload_data    = nla_data(attribute_table[3 /* FRAME */]);
-      payload_len     = nla_len(attribute_table[3 /* FRAME */]);
+   if (genlink_header->cmd == NL80211_CMD_FRAME) {
+      payload_data    = nla_data(attribute_table[NL80211_ATTR_FRAME]);
+      payload_len     = nla_len(attribute_table[NL80211_ATTR_FRAME]);
 
-      mac       = nla_data(attribute_table[2 /* TRANSMITTER */ ]);
-      cookie    = nla_get_u64(attribute_table[8 /* COOKIE */ ]);
-      flags     = nla_get_u32(attribute_table[4 /* FLAGS */ ]);
+      mac       = nla_data(attribute_table[NL80211_ATTR_MAC]);
+      cookie    = nla_get_u64(attribute_table[NL80211_ATTR_COOKIE]);
+      flags     = nla_get_u32(attribute_table[NL80211_ATTR_STA_FLAGS]);
 
-      tx_rate     = nla_data(attribute_table[ 7 /* TX RATE */ ]);
-      tx_rate_len = nla_len(attribute_table[ 7 /* TX RATE */ ]);
+      tx_rate     = nla_data(attribute_table[ NL80211_CMD_SET_TX_BITRATE_MASK ]);
+      tx_rate_len = nla_len(attribute_table[ NL80211_CMD_SET_TX_BITRATE_MASK]);
 
-      tx_rate_info     = nla_data(attribute_table[ 21 /* TX RATE INFO */ ]);
-      tx_rate_info_len = nla_len(attribute_table[ 21 /* TX RATE INFO */ ]);
+      tx_rate_info     = nla_data(attribute_table[ NL80211_ATTR_TX_RATES ]);
+      tx_rate_info_len = nla_len(attribute_table[ NL80211_ATTR_TX_RATES]);
 
       frame_type = (payload_data[0] >> 2) & 0x3;
 
@@ -236,9 +255,9 @@ int netlink_frame_callback(struct nl_msg *netlink_message, void *arg)
       }
 
       return bladerf_tx_frame(payload_data, payload_len, tx_rate[0].idx, cookie); 
-   } else if (genlink_header->cmd == 7 /* FRAME */) {
+   } else if (genlink_header->cmd == NL80211_CMD_SET_CHANNEL) {
       set_new_frequency(frequency);
-      updated_freq = 1;
+      wiphy_device->updated_freq = 1;
    }
 
    return 0;
@@ -275,7 +294,7 @@ int rx_frame(struct nl_sock *netlink_sock, int netlink_family, uint8_t *ptr, int
    int status = 0;
    void *ret_ptr = NULL;
    struct nl_msg *netlink_msg = NULL;
-   int band_rate_modifier = (local_freq > 2500) ? 0 : 4;
+   int band_rate_modifier = (wiphy_devices[0].local_freq > 2500) ? 0 : 4;
 
    netlink_msg = nlmsg_alloc();
    ret_ptr = genlmsg_put(netlink_msg, NL_AUTO_PORT, NL_AUTO_SEQ, netlink_family, 0, 0, /* FRAME */ 2, 0);
@@ -287,8 +306,8 @@ int rx_frame(struct nl_sock *netlink_sock, int netlink_family, uint8_t *ptr, int
    nla_put(netlink_msg, 3 /* FRAME */, len, ptr);
    nla_put_u32(netlink_msg, 5 /* RX RATE */, mod + band_rate_modifier);
    nla_put_u32(netlink_msg, 6 /* SIGNAL */, -50);
-   if (!force_freq && updated_freq)
-      nla_put_u32(netlink_msg, 19 /* FREQ */, local_freq);
+   if (!wiphy_devices[0].force_freq && wiphy_devices[0].updated_freq)
+      nla_put_u32(netlink_msg, 19 /* FREQ */, wiphy_devices[0].local_freq);
 
    status = nl_send_auto(netlink_sock, netlink_msg);
    if (status < 0) {
@@ -299,47 +318,48 @@ int rx_frame(struct nl_sock *netlink_sock, int netlink_family, uint8_t *ptr, int
    return 0;
 }
 
-int set_new_frequency(unsigned long freq) {
-   unsigned long tx_freq;
+int set_new_frequency(bladerf_frequency freq) {
+   bladerf_frequency tx_freq;
    int status = 0;
 
-   if (force_freq)
+   if (wiphy_devices[0].force_freq)
       return 0;
 
-   if (freq == local_freq)
+   if (freq == wiphy_devices[0].local_freq)
       return 0;
 
-   if (!bladeRF_dev)
+   if (!wiphy_devices[0].bladeRF_dev)
       return 0;
 
    if (debug_mode) {
-      printf("Changing channel to %luMHz\n", freq);
+      printf("Changing channel to %lu Hz\n", freq);
    }
 
-   status = bladerf_set_frequency(bladeRF_dev, BLADERF_CHANNEL_RX(0), freq * 1000UL * 1000UL);
+   status = bladerf_set_frequency(wiphy_devices[0].bladeRF_dev, BLADERF_CHANNEL_RX(0), freq);
    if (status != 0) {
-      printf("Could not set RX frequency to freq=%luMHz, error=%d", freq, status);
+      printf("Could not set RX frequency to freq=% " BLADERF_PRIuFREQ " Hz, error=%d, %s\n", freq, status, bladerf_strerror(status));
       return status;
    }
 
-   if (local_tx_freq) {
-      tx_freq = local_tx_freq;
+   if (wiphy_devices[0].local_tx_freq) {
+      tx_freq = wiphy_devices[0].local_tx_freq;
    } else {
       tx_freq = freq;
    }
-   status = bladerf_set_frequency(bladeRF_dev, BLADERF_CHANNEL_TX(0), tx_freq  * 1000UL * 1000UL);
+   status = bladerf_set_frequency(wiphy_devices[0].bladeRF_dev, BLADERF_CHANNEL_TX(0), tx_freq);
    if (status != 0) {
-      printf("Could not set TX frequency to freq=%luMHz, error=%d", tx_freq, status);
+      printf("Could not set TX frequency to freq=%" BLADERF_PRIuFREQ ", error=%d, %s\n", tx_freq, status, bladerf_strerror(status));
       return status;
    }
 
-   printf("Set RX to %luMHz and TX to %luMHz\n", freq, tx_freq);
+   printf("Set RX to %" BLADERF_PRIuFREQ " and TX to %" BLADERF_PRIuFREQ "\n", freq, tx_freq);
 
-   local_freq = freq;
+   wiphy_devices[0].local_freq = freq;
 
    return 0;
 }
-int config_bladeRF(char *dev_str) {
+
+int config_bladeRF(char *dev_str, wiphy_device_t *wiphy_device) {
    int status = 0;
    struct bladerf_version fpga_ver;
    const int num_buffers = 4096;
@@ -347,20 +367,20 @@ int config_bladeRF(char *dev_str) {
    const int num_transfers = 16;
    const int stream_timeout = 10000000;
 
-#define TWENTY_MHZ (20 * 1000 * 1000)
+
    bladerf_sample_rate sample_rate = TWENTY_MHZ;
    bladerf_bandwidth   req_bw, actual_bw;
    req_bw = TWENTY_MHZ;
 
 
    printf("Opening bladeRF with dev_str=%s\n", dev_str ? : "(NULL)");
-   status = bladerf_open(&bladeRF_dev, NULL);
+   status = bladerf_open(&wiphy_device->bladeRF_dev, NULL);
    if (status != 0) {
       printf("Error opening bladeRF error=%d\n", status);
       return status;
    }
 
-   status = bladerf_fpga_version(bladeRF_dev, &fpga_ver);
+   status = bladerf_fpga_version(wiphy_device->bladeRF_dev, &fpga_ver);
    if (status != 0) {
       printf("Could not query FPGA version, error=%d\n", status);
       return status;
@@ -373,7 +393,7 @@ int config_bladeRF(char *dev_str) {
       return -1;
    }
 
-   status = bladerf_sync_config(bladeRF_dev, BLADERF_RX_X1,
+   status = bladerf_sync_config(wiphy_device->bladeRF_dev, BLADERF_RX_X1,
                      BLADERF_FORMAT_PACKET_META, num_buffers, num_dwords_buffer,
                      num_transfers, stream_timeout);
    if (status != 0) {
@@ -381,7 +401,7 @@ int config_bladeRF(char *dev_str) {
       return status;
    }
 
-   status = bladerf_sync_config(bladeRF_dev, BLADERF_TX_X1,
+   status = bladerf_sync_config(wiphy_device->bladeRF_dev, BLADERF_TX_X1,
                      BLADERF_FORMAT_PACKET_META, num_buffers, num_dwords_buffer,
                      num_transfers, stream_timeout);
    if (status != 0) {
@@ -389,61 +409,61 @@ int config_bladeRF(char *dev_str) {
       return status;
    }
 
-   status = bladerf_set_sample_rate(bladeRF_dev, BLADERF_CHANNEL_RX(0),
+   status = bladerf_set_sample_rate(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_RX(0),
                               sample_rate, NULL);
    if (status != 0) {
       printf("Could not set RX sample rate, error=%d\n", status);
       return status;
    }
 
-   status = bladerf_set_sample_rate(bladeRF_dev, BLADERF_CHANNEL_TX(0),
+   status = bladerf_set_sample_rate(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_TX(0),
                               sample_rate, NULL);
    if (status != 0) {
       printf("Could not set TX sample rate, error=%d\n", status);
       return status;
    }
-   
-   if (disable_agc) {
+
+   if (wiphy_devices[0].disable_agc) {
       if (debug_mode) {
-         printf("Disabling AGC and setting RX gain to %d\n", rx_gain);
+         printf("Disabling AGC and setting RX gain to %d\n", wiphy_devices[0].rx_gain);
       }
-      status = bladerf_set_gain_mode(bladeRF_dev, BLADERF_CHANNEL_RX(0), BLADERF_GAIN_MGC);
+      status = bladerf_set_gain_mode(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_RX(0), BLADERF_GAIN_MGC);
       if (status != 0) {
          printf("Could not disable AGC and set RX gain mode to manual, error=%d\n", status);
          return status;
       }
-      status = bladerf_set_gain(bladeRF_dev, BLADERF_CHANNEL_RX(0), rx_gain);
+      status = bladerf_set_gain(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_RX(0), wiphy_devices[0].rx_gain);
       if (status != 0) {
          printf("Could not set manual RX gain, error=%d\n", status);
          return status;
       }
    }
 
-   status = bladerf_enable_module(bladeRF_dev, BLADERF_MODULE_TX, true);
+   status = bladerf_enable_module(wiphy_device->bladeRF_dev, BLADERF_MODULE_TX, true);
    if (status != 0) {
       printf("Could not enable TX module, error=%d\n", status);
       return status;
    }
 
-   status = bladerf_enable_module(bladeRF_dev, BLADERF_MODULE_RX, true);
+   status = bladerf_enable_module(wiphy_device->bladeRF_dev, BLADERF_MODULE_RX, true);
    if (status != 0) {
       printf("Could not enable RX module, error=%d\n", status);
       return status;
    }
-   bladerf_set_gain_stage(bladeRF_dev, BLADERF_CHANNEL_TX(0), "dsa", tx_gain);
-   bladerf_set_bias_tee(bladeRF_dev, BLADERF_CHANNEL_RX(0), true);
-   bladerf_set_bias_tee(bladeRF_dev, BLADERF_CHANNEL_RX(1), true);
-   bladerf_set_bias_tee(bladeRF_dev, BLADERF_CHANNEL_TX(0), true);
-   bladerf_set_bias_tee(bladeRF_dev, BLADERF_CHANNEL_TX(1), true);
+   bladerf_set_gain_stage(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_TX(0), "dsa", wiphy_devices[0].tx_gain);
+   bladerf_set_bias_tee(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_RX(0), true);
+   bladerf_set_bias_tee(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_RX(1), true);
+   bladerf_set_bias_tee(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_TX(0), true);
+   bladerf_set_bias_tee(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_TX(1), true);
 
-   status = bladerf_set_bandwidth(bladeRF_dev, BLADERF_CHANNEL_RX(0), req_bw, &actual_bw);
+   status = bladerf_set_bandwidth(wiphy_device->bladeRF_dev, BLADERF_CHANNEL_RX(0), req_bw, &actual_bw);
    if (status != 0) {
       printf("Could not set RX bandwidth, error=%d\n", status);
       return status;
    }
    printf("RX bandwidth set to %d Hz\n", actual_bw);
 
-   status = bladerf_set_bandwidth(bladeRF_dev, BLADERF_CHANNEL_TX(0), req_bw, &actual_bw);
+   status = bladerf_set_bandwidth(wiphy_devices[0].bladeRF_dev, BLADERF_CHANNEL_TX(0), req_bw, &actual_bw);
    if (status != 0) {
       printf("Could not set TX bandwidth, error=%d\n", status);
       return status;
@@ -467,7 +487,7 @@ int receive_test() {
       memset(&meta, '0', sizeof(meta));
       if (!max_cnt)
          fprintf(stderr, "Awaiting first benchmark packet.");
-      status = bladerf_sync_rx(bladeRF_dev, data, 1000, &meta, max_cnt ? 2500 : 0);
+      status = bladerf_sync_rx(wiphy_devices[0].bladeRF_dev, data, 1000, &meta, max_cnt ? 2500 : 0);
       if (status == -6) {
          int i;
          int cnt = 0;
@@ -500,14 +520,15 @@ int receive_test() {
 }
 
 void *rx_thread(void *arg) {
+   wiphy_device_t *wiphy_device = (wiphy_device_t *)arg;
 
-   bladerf_trim_dac_write(bladeRF_dev, 0x0ea8);
+   bladerf_trim_dac_write(wiphy_device->bladeRF_dev, 0x0ea8);
    uint8_t *data = malloc(4096 * 16);
    memset(data, 0, 4096 * 16);
    while(1) {
       struct bladerf_metadata meta;
       memset(&meta, '0', sizeof(meta));
-      bladerf_sync_rx(bladeRF_dev, data, 1000, &meta, 0);
+      bladerf_sync_rx(wiphy_device->bladeRF_dev, data, 1000, &meta, 0);
       struct bladeRF_wiphy_header_rx *bwh_r = (struct bladeRF_wiphy_header_rx *)data;
       int i;
       if (debug_mode) {
@@ -544,17 +565,17 @@ void *rx_thread(void *arg) {
          printf("\n\n\n");
          //pthread_mutex_unlock(&log_mutex);
       }
-      
-      if (tun_tap) {
+
+      if (wiphy_device->tun_tap) {
          if (bwh_r->type == 1) {
-            write(tun_tap_fd, data+16, bwh_r->len - 4);
+            write(wiphy_device->tun_tap_fd, data+16, bwh_r->len - 4);
          }
       } else {
          if (bwh_r->type != 1) {
-            tx_cb(netlink_sock, netlink_family, bwh_r);
+            tx_cb(wiphy_device->netlink_sock, wiphy_device->netlink_family, bwh_r);
          }
          if (bwh_r->type == 1) {
-            rx_frame(netlink_sock, netlink_family, data+16, bwh_r->len-4, bwh_r->modulation);
+            rx_frame(wiphy_device->netlink_sock, wiphy_device->netlink_family, data+16, bwh_r->len-4, bwh_r->modulation);
          }
       }
 
@@ -604,6 +625,8 @@ int main(int argc, char *argv[])
 
    pthread_mutex_init(&log_mutex, NULL);
    struct bladerf_version ver;
+   memset(wiphy_devices, 0, sizeof(wiphy_devices));
+   wiphy_device_t *wiphy_device = &wiphy_devices[0];
 
    bladerf_version(&ver);
    if (ver.major < 2 || (ver.major == 2 && ver.minor < 4)) {
@@ -621,8 +644,8 @@ int main(int argc, char *argv[])
          freq = atol(optarg);
          printf("Overriding RX/TX frequency to %luMHz\n", freq);
       } else if (cmd == 's') {
-         local_tx_freq = atol(optarg);
-         printf("Overriding TX frequency to %luMHz\n", freq);
+         wiphy_devices[0].local_tx_freq = atol(optarg);
+         printf("Overriding TX frequency to %luMHz\n", wiphy_devices[0].local_tx_freq);
       } else if (cmd == 'r') {
          trx_test = TRX_TEST_RX;
       } else if (cmd == 'c') {
@@ -630,26 +653,26 @@ int main(int argc, char *argv[])
       } else if (cmd == 'l') {
          tx_len = atol(optarg);
       } else if (cmd == 'm') {
-         tx_mod = atol(optarg);
+         wiphy_device->tx_mod = atol(optarg);
       } else if (cmd == 't') {
          trx_test = TRX_TEST_TX;
-         tx_mod = atol(optarg);
+         wiphy_device->tx_mod = atol(optarg);
       } else if (cmd == 'a') {
-         disable_agc = 1;
-         rx_gain = atoi(optarg);
-         printf("Overriding AGC and setting RX gain to %d\n", rx_gain);
+         wiphy_device->disable_agc = 1;
+         wiphy_device->rx_gain = atoi(optarg);
+         printf("Overriding AGC and setting RX gain to %d\n", wiphy_device->rx_gain);
       } else if (cmd == 'g') {
-         tx_gain = atol(optarg);
-         printf("Overriding DSA gain to %d\n", tx_gain);
+         wiphy_device->tx_gain = atol(optarg);
+         printf("Overriding DSA gain to %d\n", wiphy_device->tx_gain);
       } else if (cmd == 'v') {
          debug_mode = 10;
       } else if (cmd == 'V') {
          debug_mode = 0;
       } else if (cmd == 'H') {
-         half_rate_only = 1;
+         wiphy_device->half_rate_only = 1;
          printf("Overriding rate selection to half rates\n");
       } else if (cmd == 'T') {
-         tun_tap = 1;
+         wiphy_device->tun_tap = 1;
       } else if (cmd == 'h') {
          fprintf(stderr,
                "usage: bladeRF-linux-mac80211 [-d device_string] [-f frequency] [-s TX_frequency] [-H] [-r] [-t <tx test modulation>]\n"
@@ -672,13 +695,13 @@ int main(int argc, char *argv[])
       }
    }
 
-   if (config_bladeRF(dev_str)) {
+   if (config_bladeRF(dev_str, wiphy_device)) {
       return -1;
    }
 
    if (trx_test != TRX_TEST_NONE) {
       status = set_new_frequency(freq);
-      force_freq = 1;
+      wiphy_device->force_freq = 1;
       if (trx_test == TRX_TEST_RX) {
          return receive_test();
       } else if (trx_test == TRX_TEST_TX) {
@@ -686,50 +709,50 @@ int main(int argc, char *argv[])
             printf("specify a packet length greater than 32 with -l\n");
             return -1;
          }
-         return transmit_test(tx_count, tx_mod, tx_len);
+         return transmit_test(tx_count, wiphy_device->tx_mod, tx_len);
       }
    }
 
    if (freq) {
       status = set_new_frequency(freq);
-      force_freq = 1;
+      wiphy_device->force_freq = 1;
    } else {
-      status = set_new_frequency(2412);
+      status = set_new_frequency(2412 * 1000UL * 1000UL);
    }
 
    if (status) {
       printf("Could not set frequency\n");
       return -1;
    }
-   if (tun_tap) {
-      return start_tun_tap(argv[0]);
+   if (wiphy_device->tun_tap) {
+      return start_tun_tap(argv[0], wiphy_device);
    } else {
-      return start_mac80211(argv[0]);
+      return start_mac80211(argv[0], wiphy_device);
    }
 }
 
-int start_mac80211(char *cmd) {
+int start_mac80211(char *cmd, wiphy_device_t *wiphy_device) {
    int status;
    struct nl_cb *netlink_cb = NULL;
    void *ret_ptr = NULL;
 
-   netlink_sock = nl_socket_alloc();
-   if (!netlink_sock) {
+   wiphy_device->netlink_sock = nl_socket_alloc();
+   if (!wiphy_device->netlink_sock) {
       printf("nl_socket_alloc() failed\n");
       return -1;
    }
 
 
    /* connect netlink socket to generic netlink family MAC80211_HWSIM */
-   status = genl_connect(netlink_sock);
+   status = genl_connect(wiphy_devices[0].netlink_sock);
    if (status) {
       printf("genl_connect() failed with error=%d\n", status);
       return -1;
    }
 
-   netlink_family = genl_ctrl_resolve(netlink_sock, "MAC80211_HWSIM");
-   if (netlink_family < 0) {
-      printf("genl_ctrl_resolve() failed with error=%d\n", netlink_family);
+   wiphy_device->netlink_family = genl_ctrl_resolve(wiphy_devices[0].netlink_sock, "MAC80211_HWSIM");
+   if (wiphy_device->netlink_family < 0) {
+      printf("genl_ctrl_resolve() failed with error=%d\n", wiphy_device->netlink_family);
       printf("perhaps mac80211_hwsim.ko isn't loaded?\n");
       return -1;
    }
@@ -742,7 +765,7 @@ int start_mac80211(char *cmd) {
       return -1;
    }
 
-   status = nl_cb_set(netlink_cb, NL_CB_MSG_IN, NL_CB_CUSTOM, netlink_frame_callback, NULL);
+   status = nl_cb_set(netlink_cb, NL_CB_MSG_IN, NL_CB_CUSTOM, netlink_frame_callback, wiphy_device);
    if (status) {
       printf("nl_cb_set() failed with error=%d\n", status);
       return -1;
@@ -752,13 +775,13 @@ int start_mac80211(char *cmd) {
    /* send HWSIM_CMD_REGISTER generic netlink message */
    struct nl_msg *netlink_msg = NULL;
    netlink_msg = nlmsg_alloc();
-   ret_ptr = genlmsg_put(netlink_msg, NL_AUTO_PORT, NL_AUTO_SEQ, netlink_family, 0, 0, /* REGISTER */ 1, 0);
+   ret_ptr = genlmsg_put(netlink_msg, NL_AUTO_PORT, NL_AUTO_SEQ, wiphy_device->netlink_family, 0, 0, /* REGISTER */ 1, 0);
    if (!ret_ptr) {
       printf("genlmsg_put() failed\n");
       return -1;
    }
 
-   status = nl_send_auto(netlink_sock, netlink_msg);
+   status = nl_send_auto(wiphy_device->netlink_sock, netlink_msg);
    if (status < 0) {
       printf("nl_send_auto() failed with error=%d\n", status);
       return -1;
@@ -768,13 +791,13 @@ int start_mac80211(char *cmd) {
    printf("netlink registration complete\n");
 
    pthread_t rx_th;
-   pthread_create(&rx_th, NULL, rx_thread, NULL);
+   pthread_create(&rx_th, NULL, rx_thread, &wiphy_devices[0]);
 
 
    int i = 0;
    /* receive and dispatch netlink messages */
    while(1) {
-      status = nl_recvmsgs(netlink_sock, netlink_cb);
+      status = nl_recvmsgs(wiphy_device->netlink_sock, netlink_cb);
       if (status == -NLE_PERM) {
          printf("attain CAP_NET_ADMIN via `sudo setcap cap_net_admin+eip %s` "
                 "or start again with sudo\n", cmd);
@@ -789,30 +812,30 @@ int start_mac80211(char *cmd) {
    return 0;
 }
 
-int start_tun_tap(char *cmd) {
+int start_tun_tap(char *cmd, wiphy_device_t *wiphy_device) {
    int status;
    struct ifreq ifreq;
    uint8_t payload_data[4096];
    pthread_t rx_th;
 
-   tun_tap_fd = open("/dev/net/tun", O_RDWR);
-   if (tun_tap == -EPERM) {
+   wiphy_devices[0].tun_tap_fd = open("/dev/net/tun", O_RDWR);
+   if (wiphy_devices[0].tun_tap == -EPERM) {
          printf("attain CAP_NET_ADMIN via `sudo setcap cap_net_admin+eip %s` "
                 "or start again with sudo\n", cmd);
          return -1;
-   } else if (tun_tap == -ENOENT) {
-         printf("start_tun_tap() failed with error=%d\n", netlink_family);
+   } else if (wiphy_devices[0].tun_tap == -ENOENT) {
+         printf("start_tun_tap() failed with error=%d\n", wiphy_device->netlink_family);
          printf("perhaps tun.ko isn't loaded?\n");
    }
 
    memset(&ifreq, 0, sizeof(ifreq));
    ifreq.ifr_flags = IFF_TAP | IFF_NO_PI;
    strncpy(ifreq.ifr_name, "bladelan", IFNAMSIZ);
-   status = ioctl(tun_tap_fd, TUNSETIFF, &ifreq);
+   status = ioctl(wiphy_device->tun_tap_fd, TUNSETIFF, &ifreq);
 
    if (status) {
       printf("could not ioctl(TUNSETIFF), error=%d\n", status);
-      close(tun_tap_fd);
+      close(wiphy_device->tun_tap_fd);
       return -1;
    }
 
@@ -821,19 +844,19 @@ int start_tun_tap(char *cmd) {
    pthread_create(&rx_th, NULL, rx_thread, NULL);
 
    while(1) {
-      status = read(tun_tap_fd, payload_data, 4096);
+      status = read(wiphy_device->tun_tap_fd, payload_data, 4096);
       if (status < 0) {
          return -1;
       }
 
       if (debug_mode) {
          printf("TAP TX frame:\n");
-         printf("\tMod: %d\n", tx_mod);
+         printf("\tMod: %d\n", wiphy_devices[0].tx_mod);
          dump_packet(payload_data, status);
          printf("\n\n");
       }
 
-      status = bladerf_tx_frame(payload_data, status, tx_mod, 0);
+      status = bladerf_tx_frame(payload_data, status, wiphy_devices[0].tx_mod, 0);
       if (status < 0) {
          return -1;
       }

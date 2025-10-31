@@ -18,6 +18,13 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
+#define BIT(n) (1U << (n))
+#define __packed __attribute__((__packed__))
+
+typedef int8_t s8;
+typedef uint8_t u8;
+typedef uint16_t u16;
+
 struct bladeRF_wiphy_header_tx {
    uint16_t rsvd;
    uint16_t flags;

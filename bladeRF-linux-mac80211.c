@@ -37,6 +37,9 @@
 #include <stdio.h>
 #include <sys/syscall.h>
 
+#include <pcap/pcap.h>
+#include <libkmod.h>
+
 #include "bladeRF-wiphy.h"
 
 #define TWENTY_MHZ (20 * 1000 * 1000)
@@ -45,7 +48,7 @@
 
 pthread_mutex_t log_mutex;
 
-typedef struct {
+typedef struct wiphy_device {
    // bladeRF device handle
    struct bladerf *bladeRF_dev;
 
@@ -69,12 +72,9 @@ typedef struct {
    int netlink_family;
 } wiphy_device_t;
 
-
 bool debug_mode = 1;
 
 wiphy_device_t wiphy_devices[1];
-
-
 
 struct tx_rate {
    uint8_t idx;
@@ -94,6 +94,21 @@ int start_tun_tap(char *cmd, wiphy_device_t *wiphy_device);
 
 unsigned int bytes_to_dwords(int bytes) {
     return (bytes + 3) / 4;
+}
+
+void prepare_kernel() {
+   struct kmod_ctx *ctx = kmod_new(NULL, NULL);
+
+   struct kmod_module *mod;
+   kmod_module_new_from_name_lookup(ctx, "mac80211_hwsim", &mod);
+
+   int ret = kmod_module_probe_insert_module(mod, KMOD_PROBE_APPLY_BLACKLIST, NULL, NULL, NULL, NULL);
+   if (ret != 0 && ret != -EEXIST) {
+      printf("Could not insert mac80211_hwsim module, error=%d\n", ret);
+      exit(-1);
+   }
+   kmod_module_unref(mod);
+   kmod_unref(ctx);
 }
 
 int bladerf_tx_frame(uint8_t *data, int len, int modulation, uint64_t cookie) {
@@ -352,7 +367,7 @@ int set_new_frequency(bladerf_frequency freq) {
       return status;
    }
 
-   printf("Set RX to %" BLADERF_PRIuFREQ " and TX to %" BLADERF_PRIuFREQ "\n", freq, tx_freq);
+   printf("Set RX to %" BLADERF_PRIuFREQ " Hz and TX to %" BLADERF_PRIuFREQ " Hz\n", freq, tx_freq);
 
    wiphy_devices[0].local_freq = freq;
 
@@ -373,11 +388,27 @@ int config_bladeRF(char *dev_str, wiphy_device_t *wiphy_device) {
    req_bw = TWENTY_MHZ;
 
 
-   printf("Opening bladeRF with dev_str=%s\n", dev_str ? : "(NULL)");
+   printf("Opening bladeRF with dev_str = %s\n", dev_str ? : "*");
    status = bladerf_open(&wiphy_device->bladeRF_dev, NULL);
    if (status != 0) {
       printf("Error opening bladeRF error=%d\n", status);
       return status;
+   }
+
+   bladerf_fpga_source fpga_source;
+   status = bladerf_get_fpga_source(wiphy_device->bladeRF_dev, &fpga_source);
+   if (status != 0) {
+      printf("Could not get FPGA source, error=%d\n", status);
+      return status;
+   }
+
+   if (fpga_source == BLADERF_FPGA_SOURCE_UNKNOWN) {
+      printf("FPGA not loaded, loading default 'wlanxA9.rbf' FPGA\n");
+      status = bladerf_load_fpga(wiphy_device->bladeRF_dev, "wlanxA9.rbf");
+      if (status != 0) {
+         printf("Could not load FPGA, error=%d\n", status);
+         return status;
+      }
    }
 
    status = bladerf_fpga_version(wiphy_device->bladeRF_dev, &fpga_ver);
@@ -535,7 +566,7 @@ void *rx_thread(void *arg) {
          //pthread_mutex_lock(&log_mutex);
          printf("RX frame:\n");
          if (debug_mode > 2) {
-            printf("Bytes:\n");
+            printf("Bytes:\n"); 
             for (i = 0; i < 48; i++)
                printf("%.2x ", data[i]);
          }
@@ -642,7 +673,7 @@ int main(int argc, char *argv[])
          dev_str = strdup(optarg);
       } else if (cmd == 'f') {
          freq = atol(optarg);
-         printf("Overriding RX/TX frequency to %luMHz\n", freq);
+         printf("Overriding RX/TX frequency to %lu MHz\n", freq);
       } else if (cmd == 's') {
          wiphy_devices[0].local_tx_freq = atol(optarg);
          printf("Overriding TX frequency to %luMHz\n", wiphy_devices[0].local_tx_freq);
@@ -695,6 +726,8 @@ int main(int argc, char *argv[])
       }
    }
 
+   prepare_kernel();
+
    if (config_bladeRF(dev_str, wiphy_device)) {
       return -1;
    }
@@ -714,7 +747,7 @@ int main(int argc, char *argv[])
    }
 
    if (freq) {
-      status = set_new_frequency(freq);
+      status = set_new_frequency(freq * 1000UL * 1000UL);
       wiphy_device->force_freq = 1;
    } else {
       status = set_new_frequency(2412 * 1000UL * 1000UL);
@@ -841,7 +874,7 @@ int start_tun_tap(char *cmd, wiphy_device_t *wiphy_device) {
 
    printf("Registered `%s' TAP interface\n", ifreq.ifr_name);
 
-   pthread_create(&rx_th, NULL, rx_thread, NULL);
+   pthread_create(&rx_th, NULL, rx_thread, wiphy_device);
 
    while(1) {
       status = read(wiphy_device->tun_tap_fd, payload_data, 4096);

@@ -15,7 +15,7 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 # Create executable
-add_executable(bladeRF-wiphy bladeRF-linux-mac80211.c)
+add_executable(bladeRF-wiphy bladeRF-wiphy.c)
 
 # Set compile options
 target_compile_options(bladeRF-wiphy PRIVATE -g3)
